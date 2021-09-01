@@ -50,7 +50,8 @@
         "serve": {
           "builder": "@angular-devkit/build-angular:dev-server",
           "options": {
-            "browserTarget": "SP.Test:build"
+            "browserTarget": "SP.Test:build",
+            "port": 4280
           },
           "configurations": {
             "production": {
