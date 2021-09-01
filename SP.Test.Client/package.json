@@ -1,14 +1,20 @@
 {
   "name": "sp.test",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "scripts": {
     "ng": "ng",
-    "start": "ng serve",
-    "build": "ng build",
+    "ngx": "node --max-old-space-size=4096 ./node_modules/@angular/cli/bin/ng",
+    "start": "npm run ngx serve -- --configuration local",
+    "serve:local": "npm run ngx serve -- --configuration local",
+    "serve:qa": "npm run ngx serve -- --configuration qa",
+    "serve:prod": "npm run ngx serve -- --configuration prod",
+    ">>> build-notes": "had to add '-- --configuration local' so that the vs publish call: 'npm run build -- --configuration $(EnvironmentName)' gets executed properly",
+    "build": "npm run ngx build -- --configuration local",
     "build:ssr": "ng run SP.Test:server:dev",
-    "test": "ng test",
-    "lint": "ng lint",
-    "e2e": "ng e2e"
+    "test": "npm run ngx test",
+    "lint": "npm run ngx lint",
+    "e2e": "npm run ngx e2e",
+    ">>> other notes": "npm uninstall node-sass"
   },
   "private": true,
   "dependencies": {
@@ -44,6 +50,7 @@
     "@types/jasminewd2": "~2.0.8",
     "@types/node": "~12.11.6",
     "codelyzer": "^5.2.2",
+    "deepmerge": "^4.2.2",
     "jasmine-core": "~3.5.0",
     "jasmine-spec-reporter": "~4.2.1",
     "karma": "^5.2.3",
