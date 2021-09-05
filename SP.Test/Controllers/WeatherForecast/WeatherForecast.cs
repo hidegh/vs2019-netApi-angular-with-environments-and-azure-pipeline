@@ -1,6 +1,6 @@
 using System;
 
-namespace SP.Test
+namespace SP.Test.Controllers.WeatherForecast
 {
     public class WeatherForecast
     {

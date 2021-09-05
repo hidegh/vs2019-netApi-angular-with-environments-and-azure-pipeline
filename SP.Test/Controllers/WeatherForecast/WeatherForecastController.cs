@@ -3,9 +3,8 @@ using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Threading.Tasks;
 
-namespace SP.Test.Controllers
+namespace SP.Test.Controllers.WeatherForecast
 {
     [ApiController]
     [Route("[controller]")]
