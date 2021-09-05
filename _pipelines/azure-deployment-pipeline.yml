@@ -1,0 +1,485 @@
+# ASP.NET
+# Build and test ASP.NET projects.
+# Add steps that publish symbols, save build artifacts, deploy, and more:
+# https://docs.microsoft.com/azure/devops/pipelines/apps/aspnet/build-aspnet-4
+
+trigger:
+  branches:
+    include:
+    - qa
+
+pr: none
+
+workspace:
+  clean: all
+
+pool:
+  vmImage: 'windows-latest'
+  
+# Evaluation one time at template parsing
+parameters:
+
+- name: publishDBs
+  displayName: Publish With Database Deploy
+  type: boolean
+  default: true
+
+- name: useSlots
+  displayName: Use slots
+  type: boolean
+  default: true
+
+- name: destinationEnvironmentOverride
+  displayName: Destination environment override
+  type: string
+  default: $null
+  values:
+  - $null
+  - qa
+  - stg
+
+# In a pipeline, template expression variables (${{ variables.var }}) get processed at compile time, before runtime starts. Macro syntax variables ($(var)) get processed during runtime before a task runs.
+variables:
+
+  solution: '**/*.sln'
+  buildPlatform: 'Any CPU'
+  buildConfiguration: 'Release'
+ 
+  # Other variables
+  buildAuthorName: '[pipeline builder]'
+  buildAuthorEmail: 'pipeline@build.process'
+
+  # yaml pipeline folder
+  pipelineFolderName: '_pipelines'
+  
+  #
+  # CONFIGURE PROJECT HERE!
+  #
+  
+  # Angular
+  angularPackageJsonFilePath: 'SP.Test.Client\package.json'
+
+  # Build & test
+  buildMainProjectsGlob: '**\*.csproj'
+  buildTestProjectsGlob: '**\*.tests.csproj'
+  
+  # Publish
+  publishProjectsGlob: '**\SP.Test.csproj'
+
+  # Only single DB (dacpac) depl. is currenty supported (i'm aware of naming discrepancy) - but we can still "validate all"
+  noDBs: true
+  buildDbProjectsGlob: '**\*.sqlproj'
+  publishDacpacGlob: '**\SP.Test.Database.dacpac'
+
+  # Azure project, app service & resource group settings
+  companyName: 'company'
+  projectName: 'angular-net-api-test'
+  
+  prodResourceGroupName: ''
+  nonProdResourceGroupName: 'Test-Dev'
+  
+  # App service name, without env. prefix
+  appServiceName: 'sp-test'
+  
+  # Slack hook (set only the slackHookUri, the slackAzureProjectBuildUri should be correctly calculated)
+  slackHookUri: 'https://hooks.slack.com/services/*********************/************************************'
+  slackAzureProjectBuildUri: 'https://dev.azure.com/$(companyName)/$(projectName)/_build/results?buildId=$(Build.BuildId)'
+
+  # Azure specific deployment tasks (connection config)
+  # 
+  # NOTE: due to: https://github.com/microsoft/azure-pipelines-tasks/issues/10376 ...
+  # ...The AzurePowerShellV4 task DOES accept task variables ONLY when the variable is defined in the release, so that the initial value is known at the time the release is created.
+  # ...even if we set the correct value later, some Azure task might still be bound to that initial value!
+  #
+  # As a solution we started to use a generic service connector (without specifying the resource group)...
+  # ...this will require us to ALLOW MANUALLY the connection for the pipeline to be used (it's a one time action, for the very 1st run only)!
+  universalDeploymentServiceConnectionName: 'Deployment Service connection' # service connection (auth*) responsible for azure related deployments
+  
+  #
+  #
+  #
+
+  # Note - with the overrides (also with the override parameter) it's the DESTINATION environment we will deploy the source from the current branch
+  buildEnvironmentName: '' # environment (set based on branch)
+  buildVersionNumber: '' # new version number for the .NET and Angular apps
+  buildVersionTag: '' # tag used to mark commit
+  
+  # NOTE: these will be set up depending on the environment inside the connection setting script (so I prefixed the values with > to make them invalid, yet keep some meaningful sample value)
+  publishDirBase: '$(Build.ArtifactStagingDirectory)\publish\$(Build.BuildId)'
+  
+  # NOTE: deployment related connections will be set dynamically
+  deploymentServiceConnectionName: '' # not in use, see notes on: universalDeploymentServiceConnectionName
+  deploymentResourceGroup: ''
+  deploymentResourceName: ''
+
+  # NOTE: database related connections will be set dynamically - the databaseConnectionString should include a placeholder: $(databaseCatalogName) - so make sure databaseCatalogName is always set as 1st!
+  databaseCatalogName: ''
+  databaseConnectionString: ''
+
+
+steps:
+
+# Showing parameters
+- powershell: |
+    $branch_name = "$(Build.SourceBranchName)"
+    Write-Host "Branch                                 : $branch_name"
+    Write-Host "Publish DBs                            : ${{ parameters.publishDBs }}"
+    Write-Host "NO DBs (if true, no DB publish occurs) : $(noDBs)"
+    Write-Host "Use slots                              : ${{ parameters.useSlots }}"
+    Write-Host "Destination environemnt override       : ${{ parameters.destinationEnvironmentOverride }}"
+
+    # Need slot name
+    $deploySlotName = if ( $${{ parameters.useSlots }} -eq $true) { "deployment" } else { "production" }
+    Write-Host "Deploy slot name                       : $deploySlotName"
+
+    # Setting global variables!
+    Write-Host "##vso[task.setvariable variable=deploySlotName]$deploySlotName"
+
+  displayName: Pipeline parameters
+
+# Def. checkout which checkes out last commit (head), but not branch
+- checkout: self
+  persistCredentials: true
+  clean: true
+
+# # Safe abort, in case the [skip ci] in the commit message does not prevent CI to kick in again...
+# # Unfortunatelly withouth additional check it won't allow manual re-runs!
+# - powershell: $(System.DefaultWorkingDirectory)\$(pipelineFolderName)\cancelWhenNothingToDeploy.ps1 -authorName "$(buildAuthorName)" -authorEmail "$(buildAuthorEmail)"
+#   displayName: 'Safety abort (in cases when last commit was made by the pipeline itself)'
+
+#
+# Set ENVIRONMENT NAME based on BRANCH (or force/override environment)
+#
+- powershell: |
+    $branch_name = "$(Build.SourceBranchName)"
+    Write-Host "Branch: $branch_name"
+
+    $branch_env = switch ("$branch_name")
+    {
+      "master" { "PROD" }
+      "main" { "PROD"  }
+      "develop" { "STG" }
+      default { "$branch_name" }
+    }
+
+    # TODO: In case of test, here you can override the targetted environment
+    Write-Host "Applying overrides (if any)"
+
+    # auto-override (via param)
+    $destinationEnvironmentOverride = "${{ parameters.destinationEnvironmentOverride }}"
+      
+    if (![string]::IsNullOrWhiteSpace($destinationEnvironmentOverride)) {
+      Write-Host "Destination environment override via input parameter to: $destinationEnvironmentOverride"
+      $branch_env = $destinationEnvironmentOverride
+    }
+    
+    # manual override
+    # $branch_env = "qa"
+
+    # Review
+    Write-Host "---"
+    Write-Host "Branch: $branch_name, build env: $branch_env"
+
+    # Setting global variables!
+    Write-Host "##vso[task.setvariable variable=buildEnvironmentName]$branch_env"
+
+  displayName: Set ENVIRONMENT NAME based on BRANCH (or do environment manual override here)
+
+#
+# Set default environment related CONNECTION and other variables (or force/override them)
+# DB related connections must be set here (as they depend on the $build_env)!
+#
+- powershell: |
+    $build_env = "$(buildEnvironmentName)"
+    Write-Host "Build env.: $build_env"
+    
+    switch ("$build_env")
+    {
+      "PROD" {
+        # TODO: (uncomment next line for tests)
+        # Write-Host "PROD: Break is requested"; Break;
+        #
+        Write-Host "Enabling PROD settings..."
+        #
+        $deploymentServiceConnectionName = 'Need to use STATIC universalDeploymentServiceConnectionName in the AZURE tasks!'
+        $deploymentResourceGroup = '$(prodResourceGroupName)'
+        $deploymentResourceName = '$(appServiceName)'
+        #
+        # DB connection details
+        #
+        $databaseCatalogName = 'SP.Test'
+        $databaseConnectionString = "Data Source=SERVER;Persist Security Info=True;Initial Catalog=$databaseCatalogName;User ID=USER;Password=PASSWORD;Pooling=False;MultipleActiveResultSets=False;Connect Timeout=60;Encrypt=False;TrustServerCertificate=False"
+      }
+      default { 
+        $deploymentServiceConnectionName = 'Need to use STATIC universalDeploymentServiceConnectionName in the AZURE tasks!'
+        $deploymentResourceGroup = '$(nonProdResourceGroupName)'
+        $deploymentResourceName = '$(buildEnvironmentName)-$(appServiceName)'
+        #
+        # DB connection details
+        #
+        $databaseCatalogName = '$(buildEnvironmentName)-SP.Test'
+        $databaseConnectionString = "Data Source=SERVER;Persist Security Info=True;Initial Catalog=$databaseCatalogName;User ID=USER;Password=PASSWORD;Pooling=False;MultipleActiveResultSets=False;Connect Timeout=60;Encrypt=False;TrustServerCertificate=False"
+      }
+    }
+
+    # TODO: In case of test, here you can do overrides    
+    Write-Host "Applying overrides (if any)"
+    
+    # Review
+    Write-Host "---"
+    Write-Host "deploymentServiceConnectionName : $deploymentServiceConnectionName"
+    Write-Host "deploymentResourceGroup         : $deploymentResourceGroup"
+    Write-Host "deploymentResourceName          : $deploymentResourceName"
+    Write-Host "databaseCatalogName             : $databaseCatalogName"
+    Write-Host "databaseConnectionString        : $databaseConnectionString"
+
+    # Setting global variables!
+    Write-Host "##vso[task.setvariable variable=deploymentServiceConnectionName]$deploymentServiceConnectionName"
+    Write-Host "##vso[task.setvariable variable=deploymentResourceGroup]$deploymentResourceGroup"
+    Write-Host "##vso[task.setvariable variable=deploymentResourceName]$deploymentResourceName"
+    Write-Host "##vso[task.setvariable variable=databaseCatalogName]$databaseCatalogName"
+    Write-Host "##vso[task.setvariable variable=databaseConnectionString]$databaseConnectionString"
+
+  displayName: Set CONNECTION variables (or force/override them)
+
+# Display all env. variables
+- powershell: |
+    dir env:
+  displayName: Listing environment variables...
+
+
+
+#
+# Preparations: branch checkout, version & tag
+#
+
+# Need to checkout branch (not just last commit)
+- powershell: |
+    $branch = "$(Build.SourceBranch)" -replace "refs/heads/", ""
+    Write-Host "Checking out branch: $branch"
+    git checkout $branch
+  displayName: Checkout branch
+
+# Version increment
+- powershell: $(System.DefaultWorkingDirectory)\$(pipelineFolderName)\incrementVersion.ps1 -angularFile $(angularPackageJsonFilePath)
+  displayName: 'Version increment'
+
+# # Echoing sample
+# - script: echo 'New version is $(buildVersionNumber)'
+#   displayName: 'Version echo'
+
+# Power shell function call with named parameter
+- powershell: $(System.DefaultWorkingDirectory)\$(pipelineFolderName)\showVersion.ps1 -versionParameter $(buildVersionNumber)
+  displayName: 'Version display script'
+
+# Setting publish directory
+- powershell: |
+    $publishDirBase = "$(Build.ArtifactStagingDirectory)\$(buildEnvironmentName)-$(buildVersionNumber)-$(Build.BuildId)"
+    
+    Write-Host "publishDirBase: $publishDirBase"
+
+    # Setting global variables!
+    Write-Host "##vso[task.setvariable variable=publishDirBase]$publishDirBase"
+    
+  displayName: Setting specific publish directory
+
+
+
+#
+# Build & test
+#
+
+# Build
+- powershell: |
+    echo "clean"
+    dotnet clean
+
+    $projects = @(Get-ChildItem -Rec -Path "$(System.DefaultWorkingDirectory)\$(buildMainProjectsGlob)" | %{ $_.FullName })
+    echo "---`n`n`nProjects found:`n$($projects -join "`n")`n"
+    $projects | foreach {
+      echo "--- Project: $_"
+      dotnet build $_ /p:Configuration=$(buildConfiguration) /p:EnvironmentName=$(buildEnvironmentName) /p:DeleteExistingFiles=True
+    }
+  displayName: Build via CLI...
+
+# Test
+# - need to add build config parameters, which tells from which directory to pick up pre-built dll's
+- powershell: |
+    $projects = @(Get-ChildItem -Rec -Path "$(System.DefaultWorkingDirectory)\$(buildTestProjectsGlob)" | %{ $_.FullName })
+    echo "---`n`n`nProjects found:`n$($projects -join "`n")`n"
+    $projects | foreach {
+      echo "--- Project: $_"
+      dotnet test $_ --no-build /p:Configuration=$(buildConfiguration) /p:EnvironmentName=$(buildEnvironmentName)
+    }
+  displayName: Test via CLI...
+
+
+
+#
+# Deploy
+#
+
+# Publish build
+# - need to add env. parameter as the angular app gets built just at this stage
+# - need to add build config parameters, which tells publish from which directory to publish items
+- powershell: |
+
+    # NOTE:
+    # While in .NET the environment names are not case sensitive...
+    # ...in Angular: the package.json script is case sensitive and so are the environment names
+    $patchedEnvironmentName = "$(buildEnvironmentName)".toLower()
+    echo "---`n`n`nPatched env. name: $patchedEnvironmentName"
+
+    $projects = @(Get-ChildItem -Rec -Path "$(System.DefaultWorkingDirectory)\$(publishProjectsGlob)" | %{ $_.FullName })
+    echo "---`n`n`nProjects found:`n$($projects -join "`n")`n"
+    $projects | foreach {
+      echo "--- Project: $_"
+      dotnet publish $_ --no-build --output "$(publishDirBase)\projects" /p:Configuration=$(buildConfiguration) /p:EnvironmentName=$patchedEnvironmentName /p:DeleteExistingFiles=True
+    }
+  displayName: Publish to FS...
+
+# Zip build
+- task: ArchiveFiles@2
+  displayName: Archive (Zip) Files from FS deployment directory
+  inputs:
+    rootFolderOrFile: $(publishDirBase)\projects
+    includeRootFolder: false
+    archiveFile: $(publishDirBase)\projects.zip
+
+# Start deployment slot
+- task: AzureAppServiceManage@0
+  displayName: Start Slot (deployment)
+  inputs:
+    ConnectedServiceName: $(universalDeploymentServiceConnectionName)
+    ResourceGroupName: $(deploymentResourceGroup)
+    Action: Start Azure App Service
+    WebAppName: $(deploymentResourceName)
+    SpecifySlot: true
+    Slot: deployment
+  condition: and(succeeded(), eq('${{ parameters.useSlots }}', true))
+
+# Deploy Zip
+- task: AzureWebApp@1
+  displayName: 'Azure Web App Deploy'
+  inputs:
+    azureSubscription: $(universalDeploymentServiceConnectionName)
+    resourceGroupName: $(deploymentResourceGroup)
+    appType: webApp
+    appName: $(deploymentResourceName)
+    deployToSlotOrASE: eq('${{ parameters.useSlots }}', true)
+    slotName: $(deploySlotName)
+    package: $(publishDirBase)\projects.zip
+
+# Publish artefacts - so we can do some debug inside Azure DevOps
+- task: PublishBuildArtifacts@1
+  displayName: Publish atefacts - allow view/debug inside DevOps
+  inputs:
+    PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+    ArtifactName: 'drop'
+    publishLocation: 'Container'
+
+#
+# TODO: what about publishing symbols?
+#
+
+
+
+#
+# Now handle DATABASE PROJECT DEPLOYMENT
+#
+
+# Build the database project
+- task: MSBuild@1
+  displayName: Build database (dacpac)
+  inputs:
+    solution: $(System.DefaultWorkingDirectory)\$(buildDbProjectsGlob)
+    msbuildArguments: >
+      /t:Build
+      /p:Configuration=Release
+      /p:DeleteExistingFiles=True
+      /p:OutputPath="$(publishDirBase)\databases"
+  condition: and(succeeded(), eq('${{ parameters.publishDBs }}', true), eq(variables['noDBs'], false))
+
+# Deploy a SQL Server database using DACPAC or SQL scripts
+- task: SqlDacpacDeploymentOnMachineGroup@0
+  displayName: Deploy database (dacpac)
+  inputs:
+    taskType: dacpac
+    dacpacFile: $(publishDirBase)\databases\$(publishDacpacGlob)
+    targetMethod: connectionString
+    connectionString: $(databaseConnectionString)
+  condition: and(succeeded(), eq('${{ parameters.publishDBs }}', true), eq(variables['noDBs'], false))
+
+
+
+#
+# Commit and tag
+#
+
+# Commit new version to repository
+- powershell: $(System.DefaultWorkingDirectory)\$(pipelineFolderName)\pushChanges.ps1 -authorName "$(buildAuthorName)" -authorEmail "$(buildAuthorEmail)" -buildVersionNumber "$(buildVersionNumber)"
+  displayName: 'Push changes to GIT'
+
+# Calculate tag
+- powershell: $(System.DefaultWorkingDirectory)\$(pipelineFolderName)\calculateTag.ps1 -versionParameter $(buildVersionNumber) -prefix "$(buildEnvironmentName)_"
+  displayName: 'Calculate tag for commit'
+
+# Push tag
+- powershell: $(System.DefaultWorkingDirectory)\$(pipelineFolderName)\pushTag.ps1 -versionParameter $(buildVersionNumber) -tagParameter $(buildVersionTag)
+  displayName: 'Push tag to GIT'
+
+
+
+#
+# Committing "transaction"
+#
+
+# Swap slots
+- task: AzureAppServiceManage@0
+  displayName: 'Swap Slots: deployment -> prod'
+  inputs:
+    azureSubscription:  $(universalDeploymentServiceConnectionName)
+    ResourceGroupName: $(deploymentResourceGroup)
+    WebAppName: $(deploymentResourceName)
+    SourceSlot: deployment
+  condition: and(succeeded(), eq('${{ parameters.useSlots }}', true))
+
+# Clean up - stop depl. slot (always)
+- task: AzureAppServiceManage@0
+  displayName: Stop Slot (deployment)
+  inputs:
+    ConnectedServiceName: $(universalDeploymentServiceConnectionName)
+    ResourceGroupName: $(deploymentResourceGroup)
+    Action: Stop Azure App Service
+    WebAppName: $(deploymentResourceName)
+    SpecifySlot: true
+    Slot: deployment
+  condition: and(always(), eq('${{ parameters.useSlots }}', true))
+
+
+
+#
+# Reporting
+#
+
+# Slack webhooks
+- powershell: |
+    
+    Write-Host "---"
+    Write-Host "slackHookUri              : $(slackHookUri)"
+    Write-Host "slackAzureProjectBuildUri : $(slackAzureProjectBuildUri)"
+    Write-Host "deploymentResourceName    : $(deploymentResourceName)"
+    Write-Host "status                    : $(Agent.JobStatus)"
+    Write-Host "buildEnvironmentName      : $(buildEnvironmentName)"
+    Write-Host "buildVersionNumber        : $(buildVersionNumber)"
+
+    $(System.DefaultWorkingDirectory)\$(pipelineFolderName)\slackMessage.ps1 `
+      -slackHookUri $(slackHookUri) `
+      -slackAzureProjectBuildUri $(slackAzureProjectBuildUri) `
+      -resourceName "$(deploymentResourceName)" `
+      -status "$(Agent.JobStatus)" `
+      -buildEnvironmentName "$(buildEnvironmentName)" `
+      -buildVersionNumber "$(buildVersionNumber)"
+
+  displayName: Slack webhook... 
+  condition: always()
